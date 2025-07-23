@@ -1,0 +1,209 @@
+name: Convert Repository to SBOM
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo_owner:
+        description: 'Owner of the source repository'
+        required: true
+        type: string
+      source_repo_name:
+        description: 'Name of the source repository'
+        required: true
+        type: string
+      source_repo_ref:
+        description: 'Branch, tag, or commit SHA of the source repository'
+        required: false
+        default: 'main'
+        type: string
+      callback_url:
+        description: 'Optional callback URL to notify when complete'
+        required: false
+        type: string
+      sbom_id:
+        description: 'SBOM ID for tracking purposes'
+        required: false
+        type: string
+
+jobs:
+  convert-sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Validate inputs
+        run: |
+          echo "Converting SBOM for: ${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}"
+          echo "Reference: ${{ inputs.source_repo_ref }}"
+          if [ -z "${{ inputs.source_repo_owner }}" ] || [ -z "${{ inputs.source_repo_name }}" ]; then
+            echo "Error: source_repo_owner and source_repo_name are required"
+            exit 1
+          fi
+
+      - name: Set up workspace
+        run: |
+          mkdir -p /tmp/workspace
+          mkdir -p /tmp/output
+
+      - name: Download source repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Download the repository tarball
+          echo "Downloading repository tarball..."
+          
+          # Try to download using the GitHub API
+          if curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o /tmp/repo.tar.gz \
+            "https://api.github.com/repos/${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}/tarball/${{ inputs.source_repo_ref }}"; then
+            echo "Successfully downloaded repository tarball"
+          else
+            echo "Failed to download repository tarball, trying public download..."
+            # Fallback to public download (works for public repos without auth)
+            curl -L -o /tmp/repo.tar.gz \
+              "https://github.com/${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}/archive/${{ inputs.source_repo_ref }}.tar.gz"
+          fi
+          
+          # Extract the tarball
+          echo "Extracting repository..."
+          cd /tmp/workspace
+          tar -xzf /tmp/repo.tar.gz --strip-components=1
+          
+          # List contents for verification
+          echo "Repository contents:"
+          ls -la /tmp/workspace/
+
+      - name: Install Syft
+        run: |
+          echo "Installing Syft..."
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          
+          # Verify installation
+          syft version
+
+      - name: Generate SBOM with Syft
+        run: |
+          echo "Generating SBOM with Syft..."
+          cd /tmp/workspace
+          
+          # Generate CycloneDX SBOM
+          syft dir:/tmp/workspace -o cyclonedx-json=/tmp/output/bom.json
+          
+          # Verify the SBOM was created
+          if [ -f "/tmp/output/bom.json" ]; then
+            echo "SBOM generated successfully"
+            echo "SBOM file size: $(wc -c < /tmp/output/bom.json) bytes"
+            
+            # Show a preview of the SBOM (first few lines)
+            echo "SBOM preview:"
+            head -n 20 /tmp/output/bom.json
+          else
+            echo "Error: SBOM file was not generated"
+            exit 1
+          fi
+
+      - name: Validate SBOM format
+        run: |
+          echo "Validating SBOM format..."
+          
+          # Check if it's valid JSON
+          if jq empty /tmp/output/bom.json; then
+            echo "SBOM is valid JSON"
+          else
+            echo "Error: SBOM is not valid JSON"
+            exit 1
+          fi
+          
+          # Check if it contains CycloneDX markers
+          if jq -e '.bomFormat == "CycloneDX"' /tmp/output/bom.json > /dev/null; then
+            echo "SBOM is valid CycloneDX format"
+            
+            # Show some basic stats
+            COMPONENT_COUNT=$(jq '.components | length' /tmp/output/bom.json 2>/dev/null || echo "0")
+            echo "SBOM contains $COMPONENT_COUNT components"
+          else
+            echo "Warning: SBOM may not be in correct CycloneDX format"
+          fi
+
+      - name: Add metadata to SBOM
+        run: |
+          echo "Adding metadata to SBOM..."
+          
+          # Create a temporary file with enhanced metadata
+          jq --arg source_repo "${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}" \
+             --arg source_ref "${{ inputs.source_repo_ref }}" \
+             --arg generated_by "GitHub Actions + Syft" \
+             --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg sbom_id "${{ inputs.sbom_id }}" \
+             '.metadata.properties = (.metadata.properties // []) + [
+               {"name": "github:source_repo", "value": $source_repo},
+               {"name": "github:source_ref", "value": $source_ref},
+               {"name": "torqsecure:generated_by", "value": $generated_by},
+               {"name": "torqsecure:generated_at", "value": $generated_at},
+               {"name": "torqsecure:sbom_id", "value": $sbom_id}
+             ]' /tmp/output/bom.json > /tmp/output/bom_enhanced.json
+          
+          # Replace the original file
+          mv /tmp/output/bom_enhanced.json /tmp/output/bom.json
+          
+          echo "Metadata added successfully"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyclonedx-sbom
+          path: /tmp/output/bom.json
+          retention-days: 7
+          compression-level: 6
+
+      - name: Create summary
+        run: |
+          echo "## SBOM Generation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Reference:** ${{ inputs.source_repo_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**SBOM ID:** ${{ inputs.sbom_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "/tmp/output/bom.json" ]; then
+            COMPONENT_COUNT=$(jq '.components | length' /tmp/output/bom.json 2>/dev/null || echo "unknown")
+            FILE_SIZE=$(wc -c < /tmp/output/bom.json)
+            
+            echo "**Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+            echo "**Components:** $COMPONENT_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "**File Size:** $FILE_SIZE bytes" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The CycloneDX SBOM has been uploaded as an artifact and is ready for download." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            echo "SBOM generation failed. Check the logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Notify callback URL (optional)
+        if: inputs.callback_url != ''
+        run: |
+          echo "Notifying callback URL..."
+          
+          # Prepare the callback payload
+          if [ -f "/tmp/output/bom.json" ]; then
+            STATUS="success"
+            COMPONENT_COUNT=$(jq '.components | length' /tmp/output/bom.json 2>/dev/null || echo "0")
+          else
+            STATUS="failed"
+            COMPONENT_COUNT="0"
+          fi
+          
+          # Send notification (optional - requires the callback URL to be provided)
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"sbom_id\": \"${{ inputs.sbom_id }}\",
+              \"status\": \"$STATUS\",
+              \"run_id\": \"${{ github.run_id }}\",
+              \"component_count\": $COMPONENT_COUNT,
+              \"repository\": \"${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}\",
+              \"reference\": \"${{ inputs.source_repo_ref }}\"
+            }" || echo "Callback notification failed (non-critical)"
