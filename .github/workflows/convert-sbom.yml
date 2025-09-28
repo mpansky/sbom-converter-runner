@@ -154,7 +154,7 @@ jobs:
             SOURCE_COMMIT_SHA="unknown"
           fi
           
-          # Create a temporary file with enhanced metadata
+          # Create a temporary file with enhanced metadata and fix format issues
           jq --arg source_repo "${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}" \
              --arg source_ref "${{ inputs.source_repo_ref }}" \
              --arg source_commit "$SOURCE_COMMIT_SHA" \
@@ -169,7 +169,35 @@ jobs:
              --arg github_run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
              --arg workflow_name "${{ github.workflow }}" \
              --arg runner_os "${{ runner.os }}" \
-             '.metadata.properties = (.metadata.properties // []) + [
+             '
+             # Fix metadata.tools structure - convert from components array to proper tools array
+             .metadata.tools = [
+               {
+                 "vendor": "Anchore",
+                 "name": "Syft", 
+                 "version": (.metadata.tools.components[0].version // "unknown")
+               }
+             ] |
+             
+             # Remove invalid CPE values that contain @ or / in vendor/product fields
+             .components = (.components // [] | map(
+               # Remove the main cpe field if it contains invalid characters
+               if .cpe and (.cpe | test("cpe:2\\.3:a:[^:]*[@/][^:]*:")) then
+                 del(.cpe)
+               else . end |
+               
+               # Filter out invalid syft:cpe23 properties
+               if .properties then
+                 .properties = (.properties | map(
+                   if .name == "syft:cpe23" and (.value | test("cpe:2\\.3:a:[^:]*[@/][^:]*:")) then
+                     empty
+                   else . end
+                 ))
+               else . end
+             )) |
+             
+             # Add enhanced properties
+             .metadata.properties = (.metadata.properties // []) + [
                {"name": "github:source_repo", "value": $source_repo},
                {"name": "github:source_ref", "value": $source_ref},
                {"name": "github:source_commit", "value": $source_commit},
@@ -182,6 +210,8 @@ jobs:
                {"name": "github:workflow_name", "value": $workflow_name},
                {"name": "github:runner_os", "value": $runner_os}
              ] |
+             
+             # Update component metadata
              .metadata.component.name = $project_name |
              .metadata.component.version = $project_version |
              .metadata.component.type = "application" |
@@ -255,3 +285,4 @@ jobs:
               \"repository\": \"${{ inputs.source_repo_owner }}/${{ inputs.source_repo_name }}\",
               \"reference\": \"${{ inputs.source_repo_ref }}\"
             }" || echo "Callback notification failed (non-critical)"
+            
